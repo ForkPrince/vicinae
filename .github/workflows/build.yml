@@ -1,0 +1,393 @@
+name: (Auto) Build Windows arm64 releases
+
+on:
+  schedule:
+    # Weekly, Sunday 06:17 UTC.
+    - cron: "17 6 * * 0"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to build (e.g. v1.2.3). Empty builds every missing release."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-arm64-releases
+  # Never cancel a release halfway through publishing one.
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: vicinaehq/vicinae
+  # Names the Windows updater looks for on ARM64 builds; keep in sync with
+  # WindowsUpdateInstaller::assetName() in src/server/src/services/update.
+  ASSET_INSTALLER: vicinae-arm64-setup.exe
+  ASSET_PORTABLE: vicinae-arm64-portable.zip
+  # Upper bound on how many releases a single run tries to build, so a long
+  # upstream gap cannot queue dozens of hour-long builds at once.
+  MAX_BUILDS: "3"
+
+jobs:
+  check-releases:
+    name: Check upstream releases
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tags: ${{ steps.find-new.outputs.tags }}
+    steps:
+      - name: Find releases without ARM64 builds here
+        id: find-new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${REQUESTED_TAG:-}" ]]; then
+            if ! gh api "repos/${UPSTREAM_REPO}/releases/tags/${REQUESTED_TAG}" >/dev/null 2>&1; then
+              echo "::error::${REQUESTED_TAG} is not a release in ${UPSTREAM_REPO}"
+              exit 1
+            fi
+            tags=$(jq -cn --arg tag "$REQUESTED_TAG" '[$tag]')
+            echo "tags=$tags" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Newest first, drafts dropped, and restricted to the plain vX.Y.Z
+          # release tags vicinae itself accepts (this also skips -rc suffixes).
+          upstream=$(gh api --paginate "repos/${UPSTREAM_REPO}/releases?per_page=100" \
+            | jq -sc '
+                add // []
+                | map(select(.draft | not) | .tag_name)
+                | map(select(test("^v[0-9]+(\\.[0-9]+)*$")))
+                | reduce .[] as $tag ([]; if index($tag) then . else . + [$tag] end)')
+
+          # A release only counts as built once we published the ARM64 installer
+          # on it, so a hand-made release never hides a pending build.
+          built=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq -sc --arg asset "${ASSET_INSTALLER}" '
+                add // []
+                | map(select(any(.assets[]?; .name == $asset)) | .tag_name)
+                | unique')
+
+          tags=$(jq -cn \
+            --argjson upstream "$upstream" \
+            --argjson built "$built" \
+            --argjson max "${MAX_BUILDS}" '
+              def newest($n): if length > $n then .[0:$n] else . end;
+              if ($built | length) == 0 then
+                # First run: backfill only the newest release, not the whole history.
+                [$upstream[0]] | map(select(. != null))
+              else
+                # Index of the newest upstream release we already built.
+                ([$upstream | to_entries[]
+                  | select(.value as $tag | ($built | index($tag)) != null)
+                  | .key] | first) as $i
+                | if $i == null then
+                    # Our newest build is no longer listed upstream; plain diff.
+                    (($upstream - $built) | newest($max) | reverse)
+                  else
+                    # Only what upstream published after our newest build,
+                    # oldest first so releases are published in order.
+                    (($upstream[0:$i] - $built) | newest($max) | reverse)
+                  end
+              end')
+
+          echo "Upstream releases: ${upstream}"
+          echo "Already built here: ${built}"
+          echo "Releases to build: ${tags}"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+  build-windows-arm64:
+    name: Windows arm64 (${{ matrix.tag }})
+    needs: check-releases
+    if: needs.check-releases.outputs.tags != '[]'
+    runs-on: windows-11-arm
+    timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      # One broken tag must not hold back the tags that did build.
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJson(needs.check-releases.outputs.tags) }}
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+      - name: Check out the upstream release
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ matrix.tag }}
+          submodules: recursive
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out this repository for patches
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: fork
+          persist-credentials: false
+
+      - name: Apply fork patches
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=(fork/.github/patches/*.patch)
+          if (( ${#patches[@]} == 0 )); then
+            echo "No patches to apply"
+            exit 0
+          fi
+          for patch in "${patches[@]}"; do
+            if git apply --check "$patch"; then
+              git apply "$patch"
+              echo "Applied $patch"
+            else
+              echo "::notice title=Patch skipped::$patch does not apply to ${{ matrix.tag }}"
+            fi
+          done
+
+      - name: Verify the ARM64 runner
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import platform
+          import sys
+
+          machine = platform.machine().lower()
+          if machine not in ("arm64", "aarch64"):
+              raise SystemExit(f"expected an ARM64 runner, got {machine} ({sys.executable})")
+          print(f"runner architecture: {machine}")
+          PY
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: arm64
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@a9c63c7c123f3069cff414e7e482d95dfa9d8125 # v4.4.1
+        with:
+          version: 6.10.1
+          host: windows_arm64
+          target: desktop
+          arch: win64_msvc2022_arm64
+          modules: qtshadertools qtimageformats
+          cache: true
+
+      # sccache only speeds the build up, so a failure here must not fail the run.
+      # The ccache-action wrapper installs a hardcoded x64 sccache, hence the manual
+      # install of the aarch64-pc-windows-msvc build.
+      - name: Set up sccache
+        id: sccache
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          version="0.18.0"
+          url="https://github.com/mozilla/sccache/releases/download/v${version}/sccache-v${version}-aarch64-pc-windows-msvc.zip"
+          sha256="205d613fa74a9a0525e41a5ace77b1c71907d5bd4a5e668bad79111776829290"
+          dir="$RUNNER_TEMP/sccache"
+          mkdir -p "$dir"
+          curl --fail --location --retry 3 "$url" --output "$dir/sccache.zip"
+          cd "$dir"
+          echo "$sha256  sccache.zip" | sha256sum --check
+          unzip -q -o sccache.zip -d extracted
+          # The archive nests everything under a versioned directory, so locate
+          # the binary rather than assuming where it lands.
+          exe=$(find extracted -name sccache.exe -type f | head -n 1)
+          if [[ -z "$exe" ]]; then
+            echo "::error::sccache.exe is missing from the release archive"
+            exit 1
+          fi
+          exe="$(cd "$(dirname "$exe")" && pwd)/$(basename "$exe")"
+          "$exe" --start-server
+          # GITHUB_PATH wants a native path; pwd -W gives it one under Git Bash.
+          echo "$(cd "$(dirname "$exe")" && pwd -W)" >> "$GITHUB_PATH"
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          flags=(-DVICINAE_GIT_TAG="${{ matrix.tag }}")
+          flags+=(-DVICINAE_GIT_COMMIT_HASH="$(git rev-parse --short=9 HEAD)")
+          flags+=(-DVICINAE_PROVENANCE=inno)
+          if [[ "${{ steps.sccache.outputs.found }}" == "true" ]]; then
+            flags+=(-DCMAKE_C_COMPILER_LAUNCHER=sccache)
+            flags+=(-DCMAKE_CXX_COMPILER_LAUNCHER=sccache)
+          fi
+          cmake --preset windows-ci "${flags[@]}"
+
+      - name: Build
+        run: cmake --build --preset windows-ci
+
+      - name: Package (stage + installer)
+        run: >-
+          pwsh -NoProfile -File ./scripts/mkinstaller.ps1
+          -BuildDir build -Arch arm64 -Version "${{ matrix.tag }}"
+
+      - name: Package portable
+        run: >-
+          pwsh -NoProfile -Command
+          "Compress-Archive -Path build/stage/* -DestinationPath build/${{ env.ASSET_PORTABLE }} -Force"
+
+      # Guards against silently shipping an x64 tree under an arm64 name.
+      - name: Verify the ARM64 binaries
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import pathlib
+          import struct
+          import sys
+
+          MACHINES = {0x014C: "x86", 0x8664: "x64", 0xAA64: "arm64"}
+          PE_SIGNATURE = b"PE\0\0"
+
+          def machine_of(path):
+              with path.open("rb") as fh:
+                  if fh.read(2) != b"MZ":
+                      raise ValueError("not a PE image (no MZ header)")
+                  fh.seek(0x3C)
+                  pe_offset = struct.unpack("<I", fh.read(4))[0]
+                  fh.seek(pe_offset)
+                  if fh.read(4) != PE_SIGNATURE:
+                      raise ValueError("not a PE image (no PE signature)")
+                  machine = struct.unpack("<H", fh.read(2))[0]
+                  return MACHINES.get(machine, f"unknown(0x{machine:04x})")
+
+          binaries = sorted(pathlib.Path("build/bin").glob("*.exe"))
+          if not binaries:
+              raise SystemExit("no executables were produced in build/bin")
+
+          wrong = []
+          for binary in binaries:
+              arch = machine_of(binary)
+              print(f"{binary}: {arch}")
+              if arch != "arm64":
+                  wrong.append(f"{binary} is {arch}")
+
+          if wrong:
+              raise SystemExit("not an arm64 build: " + "; ".join(wrong))
+
+          plugin = pathlib.Path("build/stage/plugins/platforms/qwindows.dll")
+          if not plugin.is_file():
+              raise SystemExit(f"staged tree is missing {plugin}")
+          if machine_of(plugin) != "arm64":
+              raise SystemExit(f"{plugin} is not an arm64 Qt platform plugin")
+
+          print(f"verified {len(binaries)} arm64 executables and the Qt platform plugin")
+          sys.exit(0)
+          PY
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd build
+          sha256sum "${{ env.ASSET_INSTALLER }}" "${{ env.ASSET_PORTABLE }}" | tee SHA256SUMS
+
+      - name: sccache stats
+        if: always() && steps.sccache.outputs.found == 'true'
+        run: sccache --show-stats
+
+      - name: Upload ARM64 build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: vicinae-${{ matrix.tag }}-windows-arm64
+          path: |
+            build/${{ env.ASSET_INSTALLER }}
+            build/${{ env.ASSET_PORTABLE }}
+            build/SHA256SUMS
+          if-no-files-found: error
+
+  publish:
+    name: Publish
+    needs: [check-releases, build-windows-arm64]
+    # Publish whatever the build jobs produced, so one broken tag does not hold
+    # back the releases that did build.
+    if: |
+      !cancelled() &&
+      needs.check-releases.result == 'success' &&
+      needs.check-releases.outputs.tags != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Download ARM64 artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: vicinae-*-windows-arm64
+          # No merge-multiple: the per-artifact subdirectory is what tells us
+          # which tag each set of assets belongs to.
+          path: dist
+
+      - name: Verify checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          checksums=(*/SHA256SUMS)
+          if (( ${#checksums[@]} == 0 )); then
+            echo "::error::No ARM64 assets were built"
+            exit 1
+          fi
+          for manifest in "${checksums[@]}"; do
+            (cd "$(dirname "$manifest")" && sha256sum --check SHA256SUMS)
+          done
+
+      - name: Create releases and upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM: ${{ env.UPSTREAM_REPO }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          latest_upstream=$(gh api "repos/${UPSTREAM}/releases/latest" --jq '.tag_name')
+          dirs=(dist/*/)
+          if (( ${#dirs[@]} == 0 )); then
+            echo "::error::No ARM64 artifacts were downloaded"
+            exit 1
+          fi
+
+          for dir in "${dirs[@]}"; do
+            # Artifact names are vicinae-<tag>-windows-arm64.
+            tag=$(basename "$dir")
+            tag=${tag#vicinae-}
+            tag=${tag%-windows-arm64}
+
+            if [[ "$tag" == "$latest_upstream" ]]; then
+              latest=true
+            else
+              latest=false
+            fi
+
+            upstream_title=$(gh api "repos/${UPSTREAM}/releases/tags/$tag" --jq '.name // empty')
+            assets=$(cd "$dir" && printf -- '- `%s`\n' *)
+            notes=$(cat <<EOF
+          Automated ARM64 build of [vicinae $tag](https://github.com/$UPSTREAM/releases/tag/$tag), built on a GitHub Actions \`windows-11-arm\` runner.
+
+          These binaries are unsigned and community-built, so the self-updater is disabled for them. x86_64 builds and the source archive are published on the upstream release.
+
+          ## Assets
+          $assets
+          EOF
+          )
+
+            if ! gh release view "$tag" >/dev/null 2>&1; then
+              # This repository only holds automation, so point the tag at the
+              # default branch rather than at a commit that does not exist here.
+              gh release create "$tag" --title "${upstream_title:-Vicinae $tag}" --notes "$notes"
+            fi
+
+            gh release edit "$tag" \
+              --title "${upstream_title:-Vicinae $tag}" \
+              --notes "$notes" \
+              --latest="$latest"
+            gh release upload "$tag" "$dir"* --clobber
+            echo "Published $tag"
+          done
