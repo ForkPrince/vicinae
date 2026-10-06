@@ -304,7 +304,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    name: Publish
+    name: Publish ${{ matrix.tag }}
     needs: [check-releases, build-windows-arm64]
     # Publish whatever the build jobs produced, so one broken tag does not hold
     # back the releases that did build.
@@ -316,13 +316,20 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ${{ fromJson(needs.check-releases.outputs.tags) }}
     steps:
-      - name: Download ARM64 artifacts
+      # One artifact per job, downloaded by name. download-artifact extracts a
+      # single named artifact straight into `path`, so dist/ always holds a flat
+      # set of files for exactly one tag. Matching a pattern instead would nest
+      # per-artifact directories only when more than one artifact matched, so
+      # the layout would change with the number of tags in the run.
+      - name: Download ARM64 artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: vicinae-*-windows-arm64
-          # No merge-multiple: the per-artifact subdirectory is what tells us
-          # which tag each set of assets belongs to.
+          name: vicinae-${{ matrix.tag }}-windows-arm64
           path: dist
 
       - name: Verify checksums
@@ -330,46 +337,38 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob
-          checksums=(*/SHA256SUMS)
-          if (( ${#checksums[@]} == 0 )); then
-            echo "::error::No ARM64 assets were built"
+          assets=(*)
+          if (( ${#assets[@]} == 0 )); then
+            echo "::error::the ARM64 artifact for ${{ matrix.tag }} is empty"
             exit 1
           fi
-          for manifest in "${checksums[@]}"; do
-            (cd "$(dirname "$manifest")" && sha256sum --check SHA256SUMS)
-          done
+          sha256sum --check SHA256SUMS
 
-      - name: Create releases and upload assets
+      - name: Create the release and upload assets
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           UPSTREAM: ${{ env.UPSTREAM_REPO }}
+          TAG: ${{ matrix.tag }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          latest_upstream=$(gh api "repos/${UPSTREAM}/releases/latest" --jq '.tag_name')
-          dirs=(dist/*/)
-          if (( ${#dirs[@]} == 0 )); then
-            echo "::error::No ARM64 artifacts were downloaded"
-            exit 1
+          # Confirm the tag exists upstream; this also gates manual runs.
+          upstream=$(gh api "repos/${UPSTREAM}/releases/tags/${TAG}")
+          title=$(jq -r '.name // empty' <<<"$upstream")
+          prerelease=$(jq -r '.prerelease' <<<"$upstream")
+          latest_upstream=$(gh api "repos/${UPSTREAM}/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+
+          latest=false
+          prerelease_flag=false
+          if [[ "$prerelease" == true ]]; then
+            prerelease_flag=true
+          elif [[ "$latest_upstream" == "$TAG" ]]; then
+            latest=true
           fi
 
-          for dir in "${dirs[@]}"; do
-            # Artifact names are vicinae-<tag>-windows-arm64.
-            tag=$(basename "$dir")
-            tag=${tag#vicinae-}
-            tag=${tag%-windows-arm64}
-
-            if [[ "$tag" == "$latest_upstream" ]]; then
-              latest=true
-            else
-              latest=false
-            fi
-
-            upstream_title=$(gh api "repos/${UPSTREAM}/releases/tags/$tag" --jq '.name // empty')
-            assets=$(cd "$dir" && printf -- '- `%s`\n' *)
-            notes=$(cat <<EOF
-          Automated ARM64 build of [vicinae $tag](https://github.com/$UPSTREAM/releases/tag/$tag), built on a GitHub Actions \`windows-11-arm\` runner.
+          assets=$(cd dist && printf -- '- `%s`\n' *)
+          notes=$(cat <<EOF
+          Automated ARM64 build of [vicinae $TAG](https://github.com/$UPSTREAM/releases/tag/$TAG), built on a GitHub Actions \`windows-11-arm\` runner.
 
           These binaries are unsigned and community-built, so the self-updater is disabled for them. x86_64 builds and the source archive are published on the upstream release.
 
@@ -378,16 +377,16 @@ jobs:
           EOF
           )
 
-            if ! gh release view "$tag" >/dev/null 2>&1; then
-              # This repository only holds automation, so point the tag at the
-              # default branch rather than at a commit that does not exist here.
-              gh release create "$tag" --title "${upstream_title:-Vicinae $tag}" --notes "$notes"
-            fi
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            # This repository only holds automation, so point the tag at the
+            # default branch rather than at a commit that does not exist here.
+            gh release create "$TAG" --title "${title:-Vicinae $TAG}" --notes "$notes"
+          fi
 
-            gh release edit "$tag" \
-              --title "${upstream_title:-Vicinae $tag}" \
-              --notes "$notes" \
-              --latest="$latest"
-            gh release upload "$tag" "$dir"* --clobber
-            echo "Published $tag"
-          done
+          gh release edit "$TAG" \
+            --title "${title:-Vicinae $TAG}" \
+            --notes "$notes" \
+            --latest="$latest" \
+            --prerelease="$prerelease_flag"
+          gh release upload "$TAG" dist/* --clobber
+          echo "Published $TAG"
